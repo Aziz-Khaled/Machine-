@@ -2,6 +2,7 @@ from pathlib import Path
 import html
 import re
 import joblib
+import numpy as np
 import pandas as pd
 
 from fastapi import FastAPI, HTTPException
@@ -16,10 +17,11 @@ BASE_DIR = Path(__file__).resolve().parent
 LOS_MODEL_PATH = BASE_DIR / "modele_duree_sejour.joblib"      # page "Durée de séjour"
 CHANGE_MODEL_PATH = BASE_DIR / "bo4_change_model.joblib"      # page "Médicaments status"
 INSULIN_MODEL_PATH = BASE_DIR / "bo3_insulin_model.joblib"    # page "Traitement insuline"
+READMIT_MODEL_PATH = BASE_DIR / "diabetic_readmission_pipeline.joblib"  # page "Risque de réadmission"
 
 app = FastAPI(
     title="Hospital Stay Predictor",
-    description="Prédictions expérimentales : durée d'hospitalisation et changement de traitement"
+    description="Prédictions expérimentales : durée d'hospitalisation, changement de traitement, insuline et réadmission"
 )
 
 
@@ -116,8 +118,8 @@ def extract_categories(model, nested=False):
     if model is None or not hasattr(model, "named_steps"):
         return categories
 
-    prep = model.named_steps.get("prep")
-    if prep is None:
+    prep = model.named_steps.get("prep") or model.named_steps.get("preprocessor")
+    if prep is None or not hasattr(prep, "transformers_"):
         return categories
 
     for name, transformer, columns in prep.transformers_:
@@ -314,12 +316,11 @@ INSULIN_FEATURES = []
 INSULIN_ERROR = ""
 
 # Correspondance classe numérique -> libellé.
-# ⚠ À vérifier avec l'encodage de la cible `insulin` dans le notebook BO3.
-#   Ordre alphabétique (LabelEncoder) : Down=0, No=1, Steady=2, Up=3
+# Encodage du notebook BO3 (section 3.3) : TARGET_MAP = {"No": 0, "Steady": 1, "Down": 2, "Up": 3}
 INSULIN_CLASS_LABELS = {
-    0: "Down — dose diminuée",
-    1: "No — pas d'insuline",
-    2: "Steady — dose stable",
+    0: "No — pas d'insuline",
+    1: "Steady — dose stable",
+    2: "Down — dose diminuée",
     3: "Up — dose augmentée",
 }
 
@@ -428,6 +429,123 @@ def make_insulin_field(name, label, kind, default):
         '<div class="field">'
         f'<label for="{safe_name}">{safe_label}</label>{control}</div>'
     )
+
+
+
+# =========================================================
+# MODÈLE 4 : RISQUE DE RÉADMISSION (notebook BO1)
+# =========================================================
+
+READMIT_MODEL = None
+READMIT_FEATURES = []
+READMIT_THRESHOLD = 0.5
+READMIT_METRICS = {}
+READMIT_ERROR = ""
+
+try:
+    if not READMIT_MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Modèle introuvable : {READMIT_MODEL_PATH.name} "
+            "(place-le dans le dossier de app.py)."
+        )
+
+    saved4 = joblib.load(READMIT_MODEL_PATH)
+
+    # Format du notebook BO1 : {'pipeline', 'optimal_threshold', 'features_list', 'metrics'}
+    if isinstance(saved4, dict):
+        READMIT_MODEL = saved4.get("pipeline") or saved4.get("model")
+        READMIT_THRESHOLD = float(saved4.get("optimal_threshold", saved4.get("threshold", 0.5)))
+        READMIT_FEATURES = list(saved4.get("features_list") or saved4.get("features") or [])
+        READMIT_METRICS = {k: float(v) for k, v in (saved4.get("metrics") or {}).items()}
+    else:
+        READMIT_MODEL = saved4
+
+    if READMIT_MODEL is None:
+        raise ValueError("Aucun pipeline trouvé dans le fichier joblib.")
+
+    if not READMIT_FEATURES:
+        READMIT_FEATURES = list(getattr(READMIT_MODEL, "feature_names_in_", []))
+    if not READMIT_FEATURES:
+        raise ValueError("Impossible de récupérer les features du modèle.")
+
+except Exception as exc:
+    READMIT_MODEL = None
+    READMIT_ERROR = str(exc)
+    print(f"[Risque de réadmission] modèle non chargé : {exc}")
+
+
+READMIT_CATEGORIES = extract_categories(READMIT_MODEL, nested=True)
+
+# (nom, libellé, type, valeur par défaut)
+READMIT_FIELDS = [
+    ("age", "Tranche d'âge", "age", None),
+    ("time_in_hospital", "Durée du séjour (jours)", "num", 4),
+    ("num_medications", "Nombre de médicaments", "num", 15),
+    ("num_procedures", "Nombre de procédures", "num", 1),
+    ("number_diagnoses", "Nombre de diagnostics", "num", 7),
+    ("number_outpatient", "Visites ambulatoires (année passée)", "num", 0),
+    ("number_emergency", "Passages aux urgences (année passée)", "num", 0),
+    ("number_inpatient", "Hospitalisations précédentes (année passée)", "num", 0),
+    # ⚠ À vérifier avec le notebook BO1 : définition exacte de ces deux variables
+    ("n_sejours", "Nombre de séjours du patient", "num", 1),
+    ("n_meds_used", "Nombre d'antidiabétiques utilisés", "num", 1),
+    ("insulin", "Insuline pendant le séjour", "cat", None),
+    ("change", "Changement de traitement (Ch = oui)", "cat", None),
+]
+
+READMIT_NUM_RAW = [n for n, _, k, _ in READMIT_FIELDS if k == "num"]
+READMIT_CAT_RAW = [n for n, _, k, _ in READMIT_FIELDS if k == "cat"]
+
+READMIT_DEFAULT_CATEGORIES = {
+    "insulin": ["Down", "No", "Steady", "Up"],
+    "change": ["Ch", "No"],
+}
+
+
+def make_readmit_field(name, label, kind, default):
+    safe_name = html.escape(name, quote=True)
+    safe_label = html.escape(label)
+
+    if kind == "age":
+        values = AGE_BINS
+    elif kind == "cat":
+        values = READMIT_CATEGORIES.get(name) or READMIT_DEFAULT_CATEGORIES.get(name, [])
+    else:
+        values = None
+
+    if kind == "num":
+        minimum = 1 if name == "n_sejours" else 0
+        control = (
+            f'<input type="number" id="{safe_name}" name="{safe_name}" '
+            f'value="{default}" min="{minimum}" step="1" required>'
+        )
+    elif values:
+        options = "".join(
+            f'<option value="{html.escape(v, quote=True)}">{html.escape(v)}</option>'
+            for v in values
+        )
+        control = (
+            f'<select id="{safe_name}" name="{safe_name}" required>'
+            f'<option value="">Choisir...</option>{options}</select>'
+        )
+    else:
+        control = (
+            f'<input type="text" id="{safe_name}" name="{safe_name}" '
+            f'placeholder="Saisir une valeur" required>'
+        )
+
+    return (
+        '<div class="field">'
+        f'<label for="{safe_name}">{safe_label}</label>{control}</div>'
+    )
+
+
+def readmit_metrics_text():
+    if not READMIT_METRICS:
+        return "Probabilité prédite par le modèle"
+    names = {"roc_auc": "AUC", "f1_score": "F1", "recall": "Rappel", "precision": "Précision"}
+    parts = [f"{names.get(k, k)} {v:.2f}" for k, v in READMIT_METRICS.items()]
+    return "Probabilité prédite par le modèle · test : " + " · ".join(parts)
 
 
 # =========================================================
@@ -563,6 +681,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
             <a class="nav-item __ACTIVE_LOS__" href="/">Durée de séjour</a>
             <a class="nav-item __ACTIVE_CHANGE__" href="/medicaments">Médicaments status</a>
             <a class="nav-item __ACTIVE_INSULIN__" href="/insuline">Traitement insuline</a>
+            <a class="nav-item __ACTIVE_READMIT__" href="/readmission">Risque de réadmission</a>
         </nav>
 
         <div class="sidebar-note">
@@ -823,6 +942,60 @@ function resetResult() {
 """
 
 
+READMIT_RESULT_CARD = """
+<div class="result-card">
+    <div class="result-label">Probabilité de réadmission</div>
+    <div class="result-number" id="resultNumber">-- <small>%</small></div>
+    <div class="meter">
+        <div class="meter-fill" id="meterFill"></div>
+        <div class="meter-thr" id="meterThr" title="Seuil de décision"></div>
+    </div>
+    <div class="meter-legend"><span>0 %</span><span>100 %</span></div>
+    <div><span class="verdict" id="verdict">En attente</span></div>
+    <div class="result-hint" id="resultHint" style="margin-top:10px;">
+        Le résultat apparaîtra après validation du formulaire.
+    </div>
+</div>
+"""
+
+READMIT_SCRIPT = """
+const ENDPOINT = "/predict-readmission";
+const resultNumber = document.getElementById("resultNumber");
+const resultHint = document.getElementById("resultHint");
+const verdict = document.getElementById("verdict");
+const meterFill = document.getElementById("meterFill");
+const meterThr = document.getElementById("meterThr");
+
+function showResult(r) {
+    resultNumber.innerHTML = `${r.pourcentage} <small>%</small>`;
+    meterFill.style.width = `${Math.min(100, r.pourcentage)}%`;
+    meterThr.style.left = `${r.seuil * 100}%`;
+    meterThr.style.display = "block";
+
+    if (r.readmission) {
+        verdict.textContent = "Risque de réadmission élevé";
+        verdict.className = "verdict yes";
+    } else {
+        verdict.textContent = "Risque de réadmission faible";
+        verdict.className = "verdict no";
+    }
+
+    resultHint.textContent =
+        `Seuil de décision : ${(r.seuil * 100).toFixed(1)} % ` +
+        `(trait noir, seuil optimal enregistré avec le modèle).`;
+}
+
+function resetResult() {
+    resultNumber.innerHTML = '-- <small>%</small>';
+    meterFill.style.width = "0";
+    meterThr.style.display = "none";
+    verdict.textContent = "En attente";
+    verdict.className = "verdict";
+    resultHint.textContent = "Le résultat apparaîtra après validation du formulaire.";
+}
+"""
+
+
 def render_page(*, active, title, h1, intro, fields, result_desc,
                 result_card, script, model_ok, error=""):
     alert = ""
@@ -838,6 +1011,7 @@ def render_page(*, active, title, h1, intro, fields, result_desc,
         "__ACTIVE_LOS__": "active" if active == "los" else "",
         "__ACTIVE_CHANGE__": "active" if active == "change" else "",
         "__ACTIVE_INSULIN__": "active" if active == "insulin" else "",
+        "__ACTIVE_READMIT__": "active" if active == "readmit" else "",
         "__H1__": h1,
         "__STATUS_CLASS__": "" if model_ok else "off",
         "__STATUS_TEXT__": "● Modèle chargé" if model_ok else "● Modèle indisponible",
@@ -905,6 +1079,23 @@ def insuline():
         script=INSULIN_SCRIPT,
         model_ok=INSULIN_MODEL is not None,
         error=INSULIN_ERROR,
+    )
+
+
+@app.get("/readmission", response_class=HTMLResponse)
+def readmission():
+    return render_page(
+        active="readmit",
+        title="Risque de réadmission · Hospital AI",
+        h1="Risque de réadmission",
+        intro=("Estime la probabilité qu'un patient diabétique soit réadmis "
+               "à l'hôpital après sa sortie, à partir du modèle Random Forest BO1."),
+        fields="\n".join(make_readmit_field(*f) for f in READMIT_FIELDS),
+        result_desc=html.escape(readmit_metrics_text()),
+        result_card=READMIT_RESULT_CARD,
+        script=READMIT_SCRIPT,
+        model_ok=READMIT_MODEL is not None,
+        error=READMIT_ERROR,
     )
 
 
@@ -1065,8 +1256,10 @@ def predict_insulin(patient: PatientData):
                 raise ValueError(f"{name} ne peut pas être négatif")
             row[name] = value
 
-        # Variable dérivée, calculée comme dans le notebook
+        # Variables dérivées, calculées comme dans le notebook BO3
         row["age_num"] = age_to_num(str(data["age"]))
+        # Notebook BO3 (section 3.2) : prior_visits passe par log1p avant l'entraînement
+        row["prior_visits"] = float(np.log1p(row["prior_visits"]))
 
         for name in INSULIN_CAT_RAW:
             row[name] = str(data[name]).strip()
@@ -1104,6 +1297,77 @@ def predict_insulin(patient: PatientData):
             "label": best["label"],
             "confiance": best["pourcentage"],
             "probabilites": sorted(details, key=lambda d: -d["probabilite"]),
+        }
+
+    except HTTPException:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Valeur invalide : {exc}")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur pendant la prédiction : {exc}"
+        )
+
+
+@app.post("/predict-readmission")
+def predict_readmission(patient: PatientData):
+    if READMIT_MODEL is None:
+        raise HTTPException(status_code=503, detail=f"Modèle non chargé : {READMIT_ERROR}")
+
+    data = patient.model_dump()
+
+    required = ["age"] + READMIT_NUM_RAW + READMIT_CAT_RAW
+    missing = [
+        k for k in required
+        if data.get(k) is None or str(data[k]).strip() == ""
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Champs manquants : {', '.join(missing)}"
+        )
+
+    try:
+        row = {}
+
+        for name in READMIT_NUM_RAW:
+            value = float(data[name])
+            if value < 0:
+                raise ValueError(f"{name} ne peut pas être négatif")
+            row[name] = value
+
+        # Variables dérivées, calculées comme dans le notebook BO1
+        row["age_num"] = age_to_num(str(data["age"]))
+        row["total_prior_visits"] = (
+            row["number_outpatient"]
+            + row["number_emergency"]
+            + row["number_inpatient"]
+        )
+
+        for name in READMIT_CAT_RAW:
+            row[name] = str(data[name]).strip()
+
+        absent = [f for f in READMIT_FEATURES if f not in row]
+        if absent:
+            raise HTTPException(
+                status_code=500,
+                detail=("Le modèle attend des variables absentes du formulaire : "
+                        + ", ".join(absent))
+            )
+
+        input_df = pd.DataFrame([row], columns=READMIT_FEATURES)
+
+        proba = float(READMIT_MODEL.predict_proba(input_df)[0, 1])
+
+        if not pd.notna(proba):
+            raise ValueError("Le modèle a retourné une valeur invalide.")
+
+        return {
+            "probabilite": proba,
+            "pourcentage": round(proba * 100, 1),
+            "seuil": READMIT_THRESHOLD,
+            "readmission": proba >= READMIT_THRESHOLD,
         }
 
     except HTTPException:
