@@ -15,6 +15,7 @@ from pydantic import BaseModel
 BASE_DIR = Path(__file__).resolve().parent
 LOS_MODEL_PATH = BASE_DIR / "modele_duree_sejour.joblib"      # page "Durée de séjour"
 CHANGE_MODEL_PATH = BASE_DIR / "bo4_change_model.joblib"      # page "Médicaments status"
+INSULIN_MODEL_PATH = BASE_DIR / "bo3_insulin_model.joblib"    # page "Traitement insuline"
 
 app = FastAPI(
     title="Hospital Stay Predictor",
@@ -305,6 +306,131 @@ def age_to_num(age_bin):
 
 
 # =========================================================
+# MODÈLE 3 : TRAITEMENT INSULINE (notebook BO3)
+# =========================================================
+
+INSULIN_MODEL = None
+INSULIN_FEATURES = []
+INSULIN_ERROR = ""
+
+# Correspondance classe numérique -> libellé.
+# ⚠ À vérifier avec l'encodage de la cible `insulin` dans le notebook BO3.
+#   Ordre alphabétique (LabelEncoder) : Down=0, No=1, Steady=2, Up=3
+INSULIN_CLASS_LABELS = {
+    0: "Down — dose diminuée",
+    1: "No — pas d'insuline",
+    2: "Steady — dose stable",
+    3: "Up — dose augmentée",
+}
+
+try:
+    if not INSULIN_MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Modèle introuvable : {INSULIN_MODEL_PATH.name} "
+            "(place-le dans le dossier de app.py)."
+        )
+
+    saved3 = joblib.load(INSULIN_MODEL_PATH)
+
+    # Accepte un Pipeline nu ou un dict {'model', 'features', 'classes'}
+    if isinstance(saved3, dict):
+        INSULIN_MODEL = saved3.get("model") or saved3.get("modele")
+        feats3 = saved3.get("features")
+        labels3 = saved3.get("classes") or saved3.get("labels")
+        if isinstance(labels3, dict):
+            INSULIN_CLASS_LABELS = {int(k): str(v) for k, v in labels3.items()}
+        elif labels3:
+            INSULIN_CLASS_LABELS = {i: str(v) for i, v in enumerate(labels3)}
+    else:
+        INSULIN_MODEL = saved3
+        feats3 = None
+
+    if INSULIN_MODEL is None:
+        raise ValueError("Aucun modèle trouvé dans le fichier joblib.")
+
+    if not feats3:
+        feats3 = getattr(INSULIN_MODEL, "feature_names_in_", None)
+    if feats3 is None:
+        raise ValueError("Impossible de récupérer les features du modèle.")
+
+    INSULIN_FEATURES = list(feats3)
+
+except Exception as exc:
+    INSULIN_MODEL = None
+    INSULIN_ERROR = str(exc)
+    print(f"[Traitement insuline] modèle non chargé : {exc}")
+
+
+INSULIN_CATEGORIES = extract_categories(INSULIN_MODEL, nested=True)
+
+# (nom, libellé, type, valeur par défaut)
+#   num = entier >= 0 | cat = liste lue dans le modèle | age = tranche d'âge
+INSULIN_FIELDS = [
+    ("age", "Tranche d'âge", "age", None),
+    ("time_in_hospital", "Durée du séjour (jours)", "num", 4),
+    ("num_lab_procedures", "Nombre d'analyses de laboratoire", "num", 40),
+    ("num_procedures", "Nombre de procédures", "num", 1),
+    ("num_medications", "Nombre de médicaments", "num", 15),
+    ("number_diagnoses", "Nombre de diagnostics", "num", 7),
+    ("prior_visits", "Visites antérieures (ambu. + urgences + hospit.)", "num", 0),
+    ("n_other_diab_meds", "Autres antidiabétiques prescrits", "num", 0),
+    ("diab_complication", "Complication diabétique (0 = non, 1 = oui)", "num", 0),
+    ("A1Cresult", "Résultat HbA1c", "cat", None),
+    ("max_glu_serum", "Résultat maximal de glycémie", "cat", None),
+    ("diag_1_grp", "Diagnostic principal (groupe)", "cat", None),
+    ("medical_specialty", "Spécialité médicale", "cat", None),
+    ("admission_type", "Type d'admission", "cat", None),
+    ("admission_source", "Origine de l'admission", "cat", None),
+    ("discharge", "Destination de sortie", "cat", None),
+]
+
+INSULIN_NUM_RAW = [n for n, _, k, _ in INSULIN_FIELDS if k == "num"]
+INSULIN_CAT_RAW = [n for n, _, k, _ in INSULIN_FIELDS if k == "cat"]
+
+INSULIN_DEFAULT_CATEGORIES = {
+    "A1Cresult": ["None", "Norm", ">7", ">8"],
+    "max_glu_serum": ["None", "Norm", ">200", ">300"],
+}
+
+
+def make_insulin_field(name, label, kind, default):
+    safe_name = html.escape(name, quote=True)
+    safe_label = html.escape(label)
+
+    if kind == "age":
+        values = AGE_BINS
+    elif kind == "cat":
+        values = INSULIN_CATEGORIES.get(name) or INSULIN_DEFAULT_CATEGORIES.get(name, [])
+    else:
+        values = None
+
+    if kind == "num":
+        control = (
+            f'<input type="number" id="{safe_name}" name="{safe_name}" '
+            f'value="{default}" min="0" step="1" required>'
+        )
+    elif values:
+        options = "".join(
+            f'<option value="{html.escape(v, quote=True)}">{html.escape(v)}</option>'
+            for v in values
+        )
+        control = (
+            f'<select id="{safe_name}" name="{safe_name}" required>'
+            f'<option value="">Choisir...</option>{options}</select>'
+        )
+    else:
+        control = (
+            f'<input type="text" id="{safe_name}" name="{safe_name}" '
+            f'placeholder="Saisir une valeur" required>'
+        )
+
+    return (
+        '<div class="field">'
+        f'<label for="{safe_name}">{safe_label}</label>{control}</div>'
+    )
+
+
+# =========================================================
 # PAGES HTML
 # =========================================================
 
@@ -376,6 +502,14 @@ button:disabled { opacity: 0.65; cursor: wait; }
 .meter-thr { position: absolute; top: -4px; width: 2px; height: 18px; background: #10243e; display: none; }
 .meter-legend { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); }
 
+.class-bars { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+.class-row { display: grid; grid-template-columns: minmax(0, 1fr) 46px; gap: 4px 8px; align-items: center; font-size: 11px; color: #42536a; }
+.class-row .bar { grid-column: 1 / -1; height: 6px; background: #dfe7f5; border-radius: 4px; overflow: hidden; }
+.class-row .bar div { height: 100%; width: 0; background: #9dbcfb; border-radius: 4px; transition: width .35s; }
+.class-row.top { color: var(--text); font-weight: 700; }
+.class-row.top .bar div { background: var(--blue); }
+.class-row .pct { text-align: right; }
+
 .message { margin-top: 12px; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .message.error { color: #b42318; }
 .message.success { color: #147348; }
@@ -428,6 +562,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
         <nav class="nav">
             <a class="nav-item __ACTIVE_LOS__" href="/">Durée de séjour</a>
             <a class="nav-item __ACTIVE_CHANGE__" href="/medicaments">Médicaments status</a>
+            <a class="nav-item __ACTIVE_INSULIN__" href="/insuline">Traitement insuline</a>
         </nav>
 
         <div class="sidebar-note">
@@ -643,6 +778,51 @@ function resetResult() {
 """
 
 
+INSULIN_RESULT_CARD = """
+<div class="result-card">
+    <div class="result-label">Ajustement d'insuline prédit</div>
+    <div class="result-number" id="resultNumber" style="font-size:clamp(22px,2.6vw,30px);">--</div>
+    <div class="result-hint" id="resultConf">Confiance : -- %</div>
+    <div class="class-bars" id="classBars"></div>
+    <div class="result-hint" id="resultHint" style="margin-top:10px;">
+        Le résultat apparaîtra après validation du formulaire.
+    </div>
+</div>
+"""
+
+INSULIN_SCRIPT = """
+const ENDPOINT = "/predict-insulin";
+const resultNumber = document.getElementById("resultNumber");
+const resultConf = document.getElementById("resultConf");
+const resultHint = document.getElementById("resultHint");
+const classBars = document.getElementById("classBars");
+
+function esc(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+}
+
+function showResult(r) {
+    resultNumber.textContent = r.label;
+    resultConf.textContent = `Confiance : ${r.confiance} %`;
+    classBars.innerHTML = r.probabilites.map(p => `
+        <div class="class-row ${p.classe === r.classe ? "top" : ""}">
+            <span>${esc(p.label)}</span><span class="pct">${p.pourcentage} %</span>
+            <div class="bar"><div style="width:${Math.min(100, p.pourcentage)}%"></div></div>
+        </div>`).join("");
+    resultHint.textContent = "Classe la plus probable selon la Random Forest.";
+}
+
+function resetResult() {
+    resultNumber.textContent = "--";
+    resultConf.textContent = "Confiance : -- %";
+    classBars.innerHTML = "";
+    resultHint.textContent = "Le résultat apparaîtra après validation du formulaire.";
+}
+"""
+
+
 def render_page(*, active, title, h1, intro, fields, result_desc,
                 result_card, script, model_ok, error=""):
     alert = ""
@@ -657,6 +837,7 @@ def render_page(*, active, title, h1, intro, fields, result_desc,
         "__CSS__": CSS,
         "__ACTIVE_LOS__": "active" if active == "los" else "",
         "__ACTIVE_CHANGE__": "active" if active == "change" else "",
+        "__ACTIVE_INSULIN__": "active" if active == "insulin" else "",
         "__H1__": h1,
         "__STATUS_CLASS__": "" if model_ok else "off",
         "__STATUS_TEXT__": "● Modèle chargé" if model_ok else "● Modèle indisponible",
@@ -706,6 +887,24 @@ def medicaments():
         script=CHANGE_SCRIPT,
         model_ok=CHANGE_MODEL is not None,
         error=CHANGE_ERROR,
+    )
+
+
+@app.get("/insuline", response_class=HTMLResponse)
+def insuline():
+    return render_page(
+        active="insulin",
+        title="Traitement insuline · Hospital AI",
+        h1="Traitement insuline",
+        intro=("Prédit l'ajustement du traitement à l'insuline pendant le séjour "
+               "(aucune, diminuée, stable ou augmentée) à partir du modèle "
+               "Random Forest BO3."),
+        fields="\n".join(make_insulin_field(*f) for f in INSULIN_FIELDS),
+        result_desc="Classe prédite et probabilités par classe",
+        result_card=INSULIN_RESULT_CARD,
+        script=INSULIN_SCRIPT,
+        model_ok=INSULIN_MODEL is not None,
+        error=INSULIN_ERROR,
     )
 
 
@@ -827,6 +1026,84 @@ def predict_change(patient: PatientData):
             "pourcentage": round(proba * 100, 1),
             "seuil": CHANGE_THRESHOLD,
             "changement": proba >= CHANGE_THRESHOLD,
+        }
+
+    except HTTPException:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Valeur invalide : {exc}")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur pendant la prédiction : {exc}"
+        )
+
+@app.post("/predict-insulin")
+def predict_insulin(patient: PatientData):
+    if INSULIN_MODEL is None:
+        raise HTTPException(status_code=503, detail=f"Modèle non chargé : {INSULIN_ERROR}")
+
+    data = patient.model_dump()
+
+    required = ["age"] + INSULIN_NUM_RAW + INSULIN_CAT_RAW
+    missing = [
+        k for k in required
+        if data.get(k) is None or str(data[k]).strip() == ""
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Champs manquants : {', '.join(missing)}"
+        )
+
+    try:
+        row = {}
+
+        for name in INSULIN_NUM_RAW:
+            value = float(data[name])
+            if value < 0:
+                raise ValueError(f"{name} ne peut pas être négatif")
+            row[name] = value
+
+        # Variable dérivée, calculée comme dans le notebook
+        row["age_num"] = age_to_num(str(data["age"]))
+
+        for name in INSULIN_CAT_RAW:
+            row[name] = str(data[name]).strip()
+
+        absent = [f for f in INSULIN_FEATURES if f not in row]
+        if absent:
+            raise HTTPException(
+                status_code=500,
+                detail=("Le modèle attend des variables absentes du formulaire : "
+                        + ", ".join(absent))
+            )
+
+        input_df = pd.DataFrame([row], columns=INSULIN_FEATURES)
+
+        probas = INSULIN_MODEL.predict_proba(input_df)[0]
+        classes = list(getattr(INSULIN_MODEL, "classes_", range(len(probas))))
+
+        details = []
+        for cls, p in zip(classes, probas):
+            p = float(p)
+            if not pd.notna(p):
+                raise ValueError("Le modèle a retourné une valeur invalide.")
+            key = int(cls) if str(cls).lstrip("-").isdigit() else cls
+            details.append({
+                "classe": str(cls),
+                "label": INSULIN_CLASS_LABELS.get(key, str(cls)),
+                "probabilite": p,
+                "pourcentage": round(p * 100, 1),
+            })
+
+        best = max(details, key=lambda d: d["probabilite"])
+
+        return {
+            "classe": best["classe"],
+            "label": best["label"],
+            "confiance": best["pourcentage"],
+            "probabilites": sorted(details, key=lambda d: -d["probabilite"]),
         }
 
     except HTTPException:
