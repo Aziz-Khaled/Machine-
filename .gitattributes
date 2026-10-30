@@ -1,1 +1,2 @@
 bo3_insulin_model.joblib filter=lfs diff=lfs merge=lfs -text
+modele_profil_global.joblib filter=lfs diff=lfs merge=lfs -text

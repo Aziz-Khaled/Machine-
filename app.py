@@ -18,6 +18,7 @@ LOS_MODEL_PATH = BASE_DIR / "modele_duree_sejour.joblib"      # page "Durée de 
 CHANGE_MODEL_PATH = BASE_DIR / "bo4_change_model.joblib"      # page "Médicaments status"
 INSULIN_MODEL_PATH = BASE_DIR / "bo3_insulin_model.joblib"    # page "Traitement insuline"
 READMIT_MODEL_PATH = BASE_DIR / "diabetic_readmission_pipeline.joblib"  # page "Risque de réadmission"
+PROFILE_MODEL_PATH = BASE_DIR / "modele_profil_global.joblib"  # page "Profil patient"
 
 app = FastAPI(
     title="Hospital Stay Predictor",
@@ -549,6 +550,137 @@ def readmit_metrics_text():
 
 
 # =========================================================
+# MODÈLE 5 : PROFIL GLOBAL DU PATIENT (clustering KMeans)
+# =========================================================
+
+# Le fichier contient un KMeans par volet :
+#   {'modeles': {volet: Pipeline(imputer -> scaler -> kmeans)},
+#    'volets': {volet: [features]}, 'noms_clusters': {volet: {id: nom}}, ...}
+PROFILE_MODELS = {}
+PROFILE_VOLETS = {}
+PROFILE_NAMES = {}
+PROFILE_ERROR = ""
+
+try:
+    if not PROFILE_MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Modèle introuvable : {PROFILE_MODEL_PATH.name} "
+            "(place-le dans le dossier de app.py)."
+        )
+
+    saved5 = joblib.load(PROFILE_MODEL_PATH)
+
+    if not isinstance(saved5, dict) or "modeles" not in saved5:
+        raise ValueError(
+            "Format inattendu : le fichier doit contenir "
+            "{'modeles', 'volets', 'noms_clusters'}."
+        )
+
+    PROFILE_MODELS = dict(saved5["modeles"])
+    PROFILE_VOLETS = {
+        v: list(saved5.get("volets", {}).get(v)
+                or getattr(m, "feature_names_in_", []))
+        for v, m in PROFILE_MODELS.items()
+    }
+    PROFILE_NAMES = {
+        v: {int(k): str(n) for k, n in names.items()}
+        for v, names in (saved5.get("noms_clusters") or {}).items()
+    }
+
+    if not PROFILE_MODELS:
+        raise ValueError("Aucun modèle de clustering dans le fichier.")
+    empty = [v for v, f in PROFILE_VOLETS.items() if not f]
+    if empty:
+        raise ValueError("Features introuvables pour : " + ", ".join(empty))
+
+except Exception as exc:
+    PROFILE_MODELS = {}
+    PROFILE_ERROR = str(exc)
+    print(f"[Profil patient] modèle non chargé : {exc}")
+
+
+# Description des variables : (libellé, type, défaut)
+#   int = entier >= 0 | rate = proportion entre 0 et 1 | age = tranche d'âge
+PROFILE_FIELD_INFO = {
+    # Volet 1 : consommation de soins
+    "nb_sejours": ("Nombre de séjours du patient", "int", 1),
+    "time_in_hospital_total": ("Durée totale d'hospitalisation (jours, tous séjours)", "int", 4),
+    "number_outpatient": ("Visites ambulatoires", "int", 0),
+    "number_emergency": ("Passages aux urgences", "int", 0),
+    "number_inpatient": ("Hospitalisations antérieures", "int", 0),
+    "num_lab_procedures": ("Nombre d'analyses de laboratoire", "int", 44),
+    "num_procedures": ("Nombre de procédures", "int", 1),
+    # Volet 2 : complexité médicale
+    "age_recent": ("Tranche d'âge (dernier séjour)", "age", None),
+    "number_diagnoses_recent": ("Nombre de diagnostics (dernier séjour)", "int", 8),
+    "taux_admission_Emergency": ("Part des admissions en urgence (0 à 1)", "rate", 1),
+    "taux_admission_Urgent": ("Part des admissions « Urgent » (0 à 1)", "rate", 0),
+    "taux_admission_Elective": ("Part des admissions programmées (0 à 1)", "rate", 0),
+    # Volet 3 : traitements
+    "num_diabetes_drugs_recent": ("Antidiabétiques prescrits (dernier séjour)", "int", 1),
+    "num_medications_up_recent": ("Antidiabétiques à dose augmentée", "int", 0),
+    "num_medications_down_recent": ("Antidiabétiques à dose diminuée", "int", 0),
+    "num_medications_steady_recent": ("Antidiabétiques à dose stable", "int", 1),
+    "taux_changement_traitement": ("Part des séjours avec changement de traitement (0 à 1)", "rate", 0),
+}
+
+ADMISSION_RATE_FIELDS = [
+    "taux_admission_Emergency", "taux_admission_Urgent", "taux_admission_Elective"
+]
+
+
+def profile_field_info(name):
+    return PROFILE_FIELD_INFO.get(
+        name, (name.replace("_", " ").capitalize(), "num", 0)
+    )
+
+
+def make_profile_field(name):
+    label, kind, default = profile_field_info(name)
+    safe_name = html.escape(name, quote=True)
+    safe_label = html.escape(label)
+
+    if kind == "age":
+        options = "".join(
+            f'<option value="{html.escape(v, quote=True)}">{html.escape(v)}</option>'
+            for v in AGE_BINS
+        )
+        control = (
+            f'<select id="{safe_name}" name="{safe_name}" required>'
+            f'<option value="">Choisir...</option>{options}</select>'
+        )
+    elif kind == "rate":
+        control = (
+            f'<input type="number" id="{safe_name}" name="{safe_name}" '
+            f'value="{default}" min="0" max="1" step="0.01" required>'
+        )
+    elif kind == "int":
+        minimum = 1 if name == "nb_sejours" else 0
+        control = (
+            f'<input type="number" id="{safe_name}" name="{safe_name}" '
+            f'value="{default}" min="{minimum}" step="1" required>'
+        )
+    else:
+        control = (
+            f'<input type="number" id="{safe_name}" name="{safe_name}" '
+            f'value="{default}" min="0" step="any" required>'
+        )
+
+    return (
+        '<div class="field">'
+        f'<label for="{safe_name}">{safe_label}</label>{control}</div>'
+    )
+
+
+def profile_fields_html():
+    parts = []
+    for volet, feats in PROFILE_VOLETS.items():
+        parts.append(f'<div class="field-group">{html.escape(volet)}</div>')
+        parts.extend(make_profile_field(f) for f in feats)
+    return "\n".join(parts)
+
+
+# =========================================================
 # PAGES HTML
 # =========================================================
 
@@ -628,6 +760,17 @@ button:disabled { opacity: 0.65; cursor: wait; }
 .class-row.top .bar div { background: var(--blue); }
 .class-row .pct { text-align: right; }
 
+.field-group { grid-column: 1 / -1; margin-top: 6px; padding-bottom: 4px; border-bottom: 1px solid #eef1f6; font-size: 12px; font-weight: 800; color: var(--blue); text-transform: uppercase; letter-spacing: .04em; }
+.field-group:first-child { margin-top: 0; }
+
+.profile-row { padding: 12px 0; border-bottom: 1px solid #e0e9ff; }
+.profile-row:last-child { border-bottom: 0; padding-bottom: 0; }
+.profile-row:first-child { padding-top: 0; }
+.profile-name { font-size: 18px; font-weight: 800; color: var(--blue); margin: 4px 0 8px; }
+.chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.chip { font-size: 10px; padding: 3px 8px; border-radius: 12px; background: #e6ecf6; color: #68788d; }
+.chip.on { background: var(--blue); color: white; font-weight: 700; }
+
 .message { margin-top: 12px; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .message.error { color: #b42318; }
 .message.success { color: #147348; }
@@ -682,6 +825,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
             <a class="nav-item __ACTIVE_CHANGE__" href="/medicaments">Médicaments status</a>
             <a class="nav-item __ACTIVE_INSULIN__" href="/insuline">Traitement insuline</a>
             <a class="nav-item __ACTIVE_READMIT__" href="/readmission">Risque de réadmission</a>
+            <a class="nav-item __ACTIVE_PROFILE__" href="/profil">Profil patient</a>
         </nav>
 
         <div class="sidebar-note">
@@ -996,6 +1140,42 @@ function resetResult() {
 """
 
 
+PROFILE_RESULT_CARD = """
+<div class="result-card" id="profileCard">
+    <div class="result-hint" id="resultHint">
+        Le résultat apparaîtra après validation du formulaire.
+    </div>
+</div>
+"""
+
+PROFILE_SCRIPT = """
+const ENDPOINT = "/predict-profil";
+const profileCard = document.getElementById("profileCard");
+const EMPTY = '<div class="result-hint">Le résultat apparaîtra après validation du formulaire.</div>';
+
+function esc(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+}
+
+function showResult(r) {
+    profileCard.innerHTML = r.volets.map(v => `
+        <div class="profile-row">
+            <div class="result-label">${esc(v.volet)}</div>
+            <div class="profile-name">${esc(v.label)}</div>
+            <div class="chips">${v.profils.map(p =>
+                `<span class="chip ${p.cluster === v.cluster ? "on" : ""}">${esc(p.label)}</span>`
+            ).join("")}</div>
+        </div>`).join("");
+}
+
+function resetResult() {
+    profileCard.innerHTML = EMPTY;
+}
+"""
+
+
 def render_page(*, active, title, h1, intro, fields, result_desc,
                 result_card, script, model_ok, error=""):
     alert = ""
@@ -1012,6 +1192,7 @@ def render_page(*, active, title, h1, intro, fields, result_desc,
         "__ACTIVE_CHANGE__": "active" if active == "change" else "",
         "__ACTIVE_INSULIN__": "active" if active == "insulin" else "",
         "__ACTIVE_READMIT__": "active" if active == "readmit" else "",
+        "__ACTIVE_PROFILE__": "active" if active == "profile" else "",
         "__H1__": h1,
         "__STATUS_CLASS__": "" if model_ok else "off",
         "__STATUS_TEXT__": "● Modèle chargé" if model_ok else "● Modèle indisponible",
@@ -1096,6 +1277,24 @@ def readmission():
         script=READMIT_SCRIPT,
         model_ok=READMIT_MODEL is not None,
         error=READMIT_ERROR,
+    )
+
+
+@app.get("/profil", response_class=HTMLResponse)
+def profil():
+    return render_page(
+        active="profile",
+        title="Profil patient · Hospital AI",
+        h1="Profil patient",
+        intro=("Classe le patient dans un profil pour chacun des trois volets "
+               "(consommation de soins, complexité médicale, traitements) "
+               "à partir des modèles de clustering KMeans."),
+        fields=profile_fields_html(),
+        result_desc="Profil attribué dans chaque volet",
+        result_card=PROFILE_RESULT_CARD,
+        script=PROFILE_SCRIPT,
+        model_ok=bool(PROFILE_MODELS),
+        error=PROFILE_ERROR,
     )
 
 
@@ -1369,6 +1568,75 @@ def predict_readmission(patient: PatientData):
             "seuil": READMIT_THRESHOLD,
             "readmission": proba >= READMIT_THRESHOLD,
         }
+
+    except HTTPException:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Valeur invalide : {exc}")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur pendant la prédiction : {exc}"
+        )
+
+@app.post("/predict-profil")
+def predict_profil(patient: PatientData):
+    if not PROFILE_MODELS:
+        raise HTTPException(status_code=503, detail=f"Modèle non chargé : {PROFILE_ERROR}")
+
+    data = patient.model_dump()
+
+    all_feats = [f for feats in PROFILE_VOLETS.values() for f in feats]
+    missing = [
+        f for f in all_feats
+        if data.get(f) is None or str(data[f]).strip() == ""
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Champs manquants : {', '.join(missing)}"
+        )
+
+    try:
+        values = {}
+        for f in all_feats:
+            _, kind, _ = profile_field_info(f)
+            if kind == "age":
+                value = age_to_num(str(data[f]))
+            else:
+                value = float(data[f])
+            if value < 0:
+                raise ValueError(f"{f} ne peut pas être négatif")
+            if kind == "rate" and value > 1:
+                raise ValueError(f"{f} doit être compris entre 0 et 1")
+            values[f] = value
+
+        admission_total = sum(values.get(f, 0) for f in ADMISSION_RATE_FIELDS)
+        if admission_total > 1.0001:
+            raise ValueError(
+                "la somme des parts d'admission (urgence + urgent + programmée) "
+                "ne peut pas dépasser 1"
+            )
+
+        results = []
+        for volet, model in PROFILE_MODELS.items():
+            feats = PROFILE_VOLETS[volet]
+            input_df = pd.DataFrame([[values[f] for f in feats]], columns=feats)
+            cluster = int(model.predict(input_df)[0])
+
+            names = PROFILE_NAMES.get(volet, {})
+            n_clusters = getattr(model[-1], "n_clusters", len(names))
+            results.append({
+                "volet": volet,
+                "cluster": cluster,
+                "label": names.get(cluster, f"Profil {cluster}"),
+                "profils": [
+                    {"cluster": k, "label": names.get(k, f"Profil {k}")}
+                    for k in range(n_clusters)
+                ],
+            })
+
+        return {"volets": results}
 
     except HTTPException:
         raise
