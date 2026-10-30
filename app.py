@@ -1,5 +1,6 @@
 from pathlib import Path
 import html
+import json
 import re
 import joblib
 import numpy as np
@@ -19,6 +20,7 @@ CHANGE_MODEL_PATH = BASE_DIR / "bo4_change_model.joblib"      # page "Médicamen
 INSULIN_MODEL_PATH = BASE_DIR / "bo3_insulin_model.joblib"    # page "Traitement insuline"
 READMIT_MODEL_PATH = BASE_DIR / "diabetic_readmission_pipeline.joblib"  # page "Risque de réadmission"
 PROFILE_MODEL_PATH = BASE_DIR / "modele_profil_global.joblib"  # page "Profil patient"
+CANCER_MODEL_PATH = BASE_DIR / "modele_cancer_2.joblib"         # page "Cancer du sein"
 
 app = FastAPI(
     title="Hospital Stay Predictor",
@@ -681,6 +683,137 @@ def profile_fields_html():
 
 
 # =========================================================
+# MODÈLE 6 : DIAGNOSTIC CANCER DU SEIN (régression logistique)
+# =========================================================
+
+# Format : {'pipeline', 'nom_modele', 'variables', 'classes' {0: 'malin', 1: 'bénin'},
+#           'medianes', 'minimums', 'maximums', 'exemple_malin', 'exemple_benin',
+#           'metriques_test'}
+CANCER = {}
+CANCER_FEATURES = []
+CANCER_ERROR = ""
+
+try:
+    if not CANCER_MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Modèle introuvable : {CANCER_MODEL_PATH.name} "
+            "(place-le dans le dossier de app.py)."
+        )
+
+    saved6 = joblib.load(CANCER_MODEL_PATH)
+
+    if not isinstance(saved6, dict) or "pipeline" not in saved6:
+        raise ValueError(
+            "Format inattendu : le fichier doit contenir {'pipeline', 'variables', ...}."
+        )
+
+    CANCER = saved6
+    CANCER_FEATURES = list(
+        saved6.get("variables")
+        or getattr(saved6["pipeline"], "feature_names_in_", [])
+    )
+    if not CANCER_FEATURES:
+        raise ValueError("Impossible de récupérer les variables du modèle.")
+
+except Exception as exc:
+    CANCER = {}
+    CANCER_ERROR = str(exc)
+    print(f"[Cancer du sein] modèle non chargé : {exc}")
+
+
+CANCER_CLASSES = {int(k): str(v) for k, v in (CANCER.get("classes") or {0: "malin", 1: "bénin"}).items()}
+CANCER_MALIN = next((k for k, v in CANCER_CLASSES.items() if v.lower().startswith("malin")), 0)
+
+CANCER_MEASURES = {
+    "radius": "Rayon",
+    "texture": "Texture",
+    "perimeter": "Périmètre",
+    "area": "Aire",
+    "smoothness": "Lissage",
+    "compactness": "Compacité",
+    "concavity": "Concavité",
+    "concave points": "Points concaves",
+    "symmetry": "Symétrie",
+    "fractal dimension": "Dimension fractale",
+}
+
+CANCER_GROUPS = [
+    ("mean", "Valeurs moyennes"),
+    ("error", "Erreur standard"),
+    ("worst", "Valeurs les plus défavorables (worst)"),
+]
+
+
+def cancer_group_of(feature):
+    if feature.startswith("mean "):
+        return "mean", feature[5:]
+    if feature.startswith("worst "):
+        return "worst", feature[6:]
+    if feature.endswith(" error"):
+        return "error", feature[:-6]
+    return "other", feature
+
+
+def cancer_field_id(feature):
+    return "f_" + re.sub(r"[^0-9a-zA-Z]+", "_", feature)
+
+
+def fmt_num(x):
+    return f"{float(x):.4g}"
+
+
+def make_cancer_field(feature):
+    _, measure = cancer_group_of(feature)
+    label = CANCER_MEASURES.get(measure, measure.capitalize())
+    fid = html.escape(cancer_field_id(feature), quote=True)
+    safe_name = html.escape(feature, quote=True)
+
+    default = CANCER.get("medianes", {}).get(feature, 0)
+    lo = CANCER.get("minimums", {}).get(feature)
+    hi = CANCER.get("maximums", {}).get(feature)
+    hint = f" ({fmt_num(lo)} – {fmt_num(hi)})" if lo is not None and hi is not None else ""
+
+    return (
+        '<div class="field">'
+        f'<label for="{fid}" title="{safe_name}">{html.escape(label)}'
+        f'<span class="range">{html.escape(hint)}</span></label>'
+        f'<input type="number" id="{fid}" name="{safe_name}" '
+        f'value="{fmt_num(default)}" min="0" step="any" required></div>'
+    )
+
+
+def cancer_fields_html():
+    parts = [
+        '<div class="examples">'
+        '<span>Pré-remplir :</span>'
+        '<button type="button" class="reset" data-example="malin">Exemple malin</button>'
+        '<button type="button" class="reset" data-example="benin">Exemple bénin</button>'
+        '<button type="button" class="reset" data-example="medianes">Médianes</button>'
+        '</div>'
+    ]
+    groups = {}
+    for f in CANCER_FEATURES:
+        groups.setdefault(cancer_group_of(f)[0], []).append(f)
+    titles = dict(CANCER_GROUPS)
+    for key in [g for g, _ in CANCER_GROUPS] + ["other"]:
+        if key not in groups:
+            continue
+        parts.append(f'<div class="field-group">{html.escape(titles.get(key, "Autres variables"))}</div>')
+        parts.extend(make_cancer_field(f) for f in groups[key])
+    return "\n".join(parts)
+
+
+def cancer_metrics_text():
+    m = CANCER.get("metriques_test") or {}
+    keep = ["Accuracy", "Recall", "F1-score", "ROC-AUC"]
+    parts = [f"{k} {float(m[k]):.3f}" for k in keep if k in m]
+    nom = CANCER.get("nom_modele", "Modèle")
+    if not parts:
+        return f"Probabilité de malignité · {nom}"
+    return f"Probabilité de malignité · {nom} · test : " + " · ".join(parts)
+
+
+# =========================================================
 # PAGES HTML
 # =========================================================
 
@@ -771,6 +904,10 @@ button:disabled { opacity: 0.65; cursor: wait; }
 .chip { font-size: 10px; padding: 3px 8px; border-radius: 12px; background: #e6ecf6; color: #68788d; }
 .chip.on { background: var(--blue); color: white; font-weight: 700; }
 
+.field label .range { font-weight: 500; color: #8a98aa; margin-left: 4px; }
+.examples { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 11px; color: var(--muted); }
+.examples button { min-height: 30px; padding: 0 12px; font-size: 11px; }
+
 .message { margin-top: 12px; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .message.error { color: #b42318; }
 .message.success { color: #147348; }
@@ -826,6 +963,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
             <a class="nav-item __ACTIVE_INSULIN__" href="/insuline">Traitement insuline</a>
             <a class="nav-item __ACTIVE_READMIT__" href="/readmission">Risque de réadmission</a>
             <a class="nav-item __ACTIVE_PROFILE__" href="/profil">Profil patient</a>
+            <a class="nav-item __ACTIVE_CANCER__" href="/cancer">Cancer du sein</a>
         </nav>
 
         <div class="sidebar-note">
@@ -1176,6 +1314,85 @@ function resetResult() {
 """
 
 
+CANCER_RESULT_CARD = """
+<div class="result-card">
+    <div class="result-label">Probabilité que la tumeur soit maligne</div>
+    <div class="result-number" id="resultNumber">-- <small>%</small></div>
+    <div class="meter">
+        <div class="meter-fill" id="meterFill"></div>
+        <div class="meter-thr" id="meterThr" title="Seuil de décision"></div>
+    </div>
+    <div class="meter-legend"><span>0 %</span><span>100 %</span></div>
+    <div><span class="verdict" id="verdict">En attente</span></div>
+    <div class="result-hint" id="resultHint" style="margin-top:10px;">
+        Le résultat apparaîtra après validation du formulaire.
+    </div>
+</div>
+"""
+
+CANCER_SCRIPT_TEMPLATE = """
+const ENDPOINT = "/predict-cancer";
+const EXAMPLES = __EXAMPLES__;
+const resultNumber = document.getElementById("resultNumber");
+const resultHint = document.getElementById("resultHint");
+const verdict = document.getElementById("verdict");
+const meterFill = document.getElementById("meterFill");
+const meterThr = document.getElementById("meterThr");
+
+document.querySelectorAll("[data-example]").forEach(btn => {
+    btn.addEventListener("click", () => {
+        const values = EXAMPLES[btn.dataset.example] || {};
+        for (const el of form.elements) {
+            if (el.name && el.name in values) el.value = values[el.name];
+        }
+        resetResult();
+        message.textContent = "";
+        message.className = "message";
+    });
+});
+
+function showResult(r) {
+    resultNumber.innerHTML = `${r.pourcentage_malin} <small>%</small>`;
+    meterFill.style.width = `${Math.min(100, r.pourcentage_malin)}%`;
+    meterThr.style.left = `${r.seuil * 100}%`;
+    meterThr.style.display = "block";
+
+    if (r.malin) {
+        verdict.textContent = "Tumeur prédite maligne";
+        verdict.className = "verdict yes";
+    } else {
+        verdict.textContent = "Tumeur prédite bénigne";
+        verdict.className = "verdict no";
+    }
+    resultHint.textContent =
+        `Probabilité bénigne : ${r.pourcentage_benin} % · seuil de décision ${(r.seuil * 100).toFixed(0)} %.`;
+}
+
+function resetResult() {
+    resultNumber.innerHTML = '-- <small>%</small>';
+    meterFill.style.width = "0";
+    meterThr.style.display = "none";
+    verdict.textContent = "En attente";
+    verdict.className = "verdict";
+    resultHint.textContent = "Le résultat apparaîtra après validation du formulaire.";
+}
+"""
+
+
+def cancer_script():
+    examples = {
+        "malin": CANCER.get("exemple_malin") or {},
+        "benin": CANCER.get("exemple_benin") or {},
+        "medianes": CANCER.get("medianes") or {},
+    }
+    examples = {
+        k: {f: fmt_num(v) for f, v in d.items()} for k, d in examples.items()
+    }
+    # json.dumps + échappement de "<" pour l'insérer sans risque dans <script>
+    payload = json.dumps(examples, ensure_ascii=False).replace("<", "\\u003c")
+    return CANCER_SCRIPT_TEMPLATE.replace("__EXAMPLES__", payload)
+
+
 def render_page(*, active, title, h1, intro, fields, result_desc,
                 result_card, script, model_ok, error=""):
     alert = ""
@@ -1193,6 +1410,7 @@ def render_page(*, active, title, h1, intro, fields, result_desc,
         "__ACTIVE_INSULIN__": "active" if active == "insulin" else "",
         "__ACTIVE_READMIT__": "active" if active == "readmit" else "",
         "__ACTIVE_PROFILE__": "active" if active == "profile" else "",
+        "__ACTIVE_CANCER__": "active" if active == "cancer" else "",
         "__H1__": h1,
         "__STATUS_CLASS__": "" if model_ok else "off",
         "__STATUS_TEXT__": "● Modèle chargé" if model_ok else "● Modèle indisponible",
@@ -1295,6 +1513,24 @@ def profil():
         script=PROFILE_SCRIPT,
         model_ok=bool(PROFILE_MODELS),
         error=PROFILE_ERROR,
+    )
+
+
+@app.get("/cancer", response_class=HTMLResponse)
+def cancer():
+    return render_page(
+        active="cancer",
+        title="Cancer du sein · Hospital AI",
+        h1="Diagnostic cancer du sein",
+        intro=("Estime si une tumeur du sein est maligne ou bénigne à partir des "
+               "30 mesures des noyaux cellulaires (images de ponction), "
+               "avec le modèle de régression logistique entraîné."),
+        fields=cancer_fields_html(),
+        result_desc=html.escape(cancer_metrics_text()),
+        result_card=CANCER_RESULT_CARD,
+        script=cancer_script(),
+        model_ok=bool(CANCER),
+        error=CANCER_ERROR,
     )
 
 
@@ -1637,6 +1873,61 @@ def predict_profil(patient: PatientData):
             })
 
         return {"volets": results}
+
+    except HTTPException:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Valeur invalide : {exc}")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur pendant la prédiction : {exc}"
+        )
+
+@app.post("/predict-cancer")
+def predict_cancer(patient: PatientData):
+    if not CANCER:
+        raise HTTPException(status_code=503, detail=f"Modèle non chargé : {CANCER_ERROR}")
+
+    data = patient.model_dump()
+
+    missing = [
+        f for f in CANCER_FEATURES
+        if data.get(f) is None or str(data[f]).strip() == ""
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Champs manquants : {', '.join(missing)}"
+        )
+
+    try:
+        row = {}
+        for f in CANCER_FEATURES:
+            value = float(data[f])
+            if value < 0:
+                raise ValueError(f"{f} ne peut pas être négatif")
+            row[f] = value
+
+        input_df = pd.DataFrame([row], columns=CANCER_FEATURES)
+        model = CANCER["pipeline"]
+
+        probas = model.predict_proba(input_df)[0]
+        classes = [int(c) for c in getattr(model, "classes_", range(len(probas)))]
+        proba_malin = float(probas[classes.index(CANCER_MALIN)])
+
+        if not pd.notna(proba_malin):
+            raise ValueError("Le modèle a retourné une valeur invalide.")
+
+        seuil = 0.5  # seuil par défaut de predict()
+        return {
+            "probabilite_malin": proba_malin,
+            "pourcentage_malin": round(proba_malin * 100, 1),
+            "pourcentage_benin": round((1 - proba_malin) * 100, 1),
+            "seuil": seuil,
+            "malin": proba_malin >= seuil,
+            "diagnostic": CANCER_CLASSES.get(int(model.predict(input_df)[0]), ""),
+        }
 
     except HTTPException:
         raise
